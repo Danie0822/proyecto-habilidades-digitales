@@ -1,7 +1,7 @@
 import JSZip from 'jszip'
 
 export class WrongPasswordError extends Error {
-  constructor(message = 'Wrong password or tampered ciphertext') {
+  constructor(message = 'Hubo un error al descifrar el archivo. verifica los datos. ') {
     super(message)
     this.name = 'WrongPasswordError'
   }
@@ -26,6 +26,7 @@ const MAGIC = textEncoder.encode('CVLT')
 // Este marcador permite detectar contrasena incorrecta tras descifrar.
 const PLAIN_MARKER = textEncoder.encode('CV01')
 
+// Config de algoritmos soportados + metadatos para serializacion en header.
 const ALGORITHMS = {
   'AES-GCM': {
     id: 1,
@@ -110,6 +111,16 @@ function resolveAlgorithm(algorithmOrId) {
   throw new UnsupportedAlgorithmError('Missing algorithm')
 }
 
+function hasMagicHeader(bytes) {
+  return (
+    bytes.length >= 4 &&
+    bytes[0] === MAGIC[0] &&
+    bytes[1] === MAGIC[1] &&
+    bytes[2] === MAGIC[2] &&
+    bytes[3] === MAGIC[3]
+  )
+}
+
 async function deriveKey(password, algorithmName) {
   if (!password || typeof password !== 'string') {
     throw new WrongPasswordError('A password is required')
@@ -170,13 +181,15 @@ function wrapPlaintext(fileBuffer) {
 
 function unwrapPlaintext(decryptedBuffer) {
   const bytes = new Uint8Array(decryptedBuffer)
-  const marker = bytes.slice(0, PLAIN_MARKER.length)
+  const marker = bytes.subarray(0, PLAIN_MARKER.length)
 
   if (!equalsBytes(marker, PLAIN_MARKER)) {
     throw new WrongPasswordError()
   }
 
-  return bytes.slice(PLAIN_MARKER.length).buffer
+  const payload = bytes.subarray(PLAIN_MARKER.length)
+  // Se retorna una copia exacta para desacoplar el resultado del buffer original.
+  return payload.slice().buffer
 }
 
 function parseHeader(encryptedBuffer) {
@@ -186,8 +199,7 @@ function parseHeader(encryptedBuffer) {
     throw new CorruptFileError('Encrypted file is too small')
   }
 
-  const magic = view.slice(0, 4)
-  if (!equalsBytes(magic, MAGIC)) {
+  if (!hasMagicHeader(view)) {
     throw new CorruptFileError('Missing CryptoVault magic header')
   }
 
@@ -201,8 +213,9 @@ function parseHeader(encryptedBuffer) {
     throw new CorruptFileError('Encrypted payload is truncated')
   }
 
-  const iv = view.slice(ivStart, ivEnd)
-  const ciphertext = view.slice(ivEnd)
+  // subarray evita copias grandes; WebCrypto acepta TypedArray como BufferSource.
+  const iv = view.subarray(ivStart, ivEnd)
+  const ciphertext = view.subarray(ivEnd)
 
   return { config, iv, ciphertext }
 }
@@ -245,9 +258,8 @@ export async function decryptFile(encryptedBuffer, password, algorithm) {
   const { config, iv, ciphertext } = parseHeader(normalized)
 
   if (algorithm && algorithm !== config.name) {
-    throw new UnsupportedAlgorithmError(
-      `File uses ${config.name}, but ${algorithm} was requested`,
-    )
+    // No filtramos detalles del algoritmo real para evitar pistas al usuario.
+    throw new WrongPasswordError()
   }
 
   const key = await deriveKey(password, config.name)
@@ -293,29 +305,39 @@ export async function packFiles(fileList) {
   return zip.generateAsync({
     type: 'arraybuffer',
     compression: 'DEFLATE',
-    compressionOptions: { level: 9 },
+    // Nivel medio: mejor balance entre CPU y tamano para lotes grandes.
+    compressionOptions: { level: 6 },
   })
 }
 
-export async function unpackZip(arrayBuffer) {
+export async function unpackZip(arrayBuffer, options = {}) {
+  const metadataOnly = options?.metadataOnly === true
+
   try {
     const zip = await JSZip.loadAsync(ensureArrayBuffer(arrayBuffer))
     const entries = []
 
-    await Promise.all(
-      Object.values(zip.files).map(async (entry) => {
-        if (entry.dir) {
-          return
-        }
+    for (const entry of Object.values(zip.files)) {
+      if (entry.dir) {
+        continue
+      }
 
-        const data = await entry.async('arraybuffer')
+      if (metadataOnly) {
         entries.push({
           name: entry.name,
-          size: data.byteLength,
-          data,
+          // JSZip no expone size por API publica en este punto; fallback seguro a 0.
+          size: typeof entry._data?.uncompressedSize === 'number' ? entry._data.uncompressedSize : 0,
         })
-      }),
-    )
+        continue
+      }
+
+      const data = await entry.async('arraybuffer')
+      entries.push({
+        name: entry.name,
+        size: data.byteLength,
+        data,
+      })
+    }
 
     // Se devuelve metadata + binario para poder mostrar lista y permitir descarga.
     return entries
@@ -349,7 +371,7 @@ export function detectAlgorithmFromEncryptedBuffer(encryptedBuffer) {
   const bytes = new Uint8Array(normalized)
 
   // Validacion rapida de firma antes de intentar descifrar.
-  if (bytes.length < 5 || !equalsBytes(bytes.slice(0, 4), MAGIC)) {
+  if (bytes.length < 5 || !hasMagicHeader(bytes)) {
     throw new CorruptFileError('Not a CryptoVault encrypted file')
   }
 

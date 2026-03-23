@@ -1,24 +1,35 @@
-import { decryptFile, encryptFile } from '../utils/cryptoUtils'
+import { decryptFile, encryptFile, isZipBuffer, packFiles, unpackZip } from '../utils/cryptoUtils'
 
-let fakeProgress = 0
-let fakeTimer = null
+const progressByTaskId = new Map()
 
 function startProgress(id) {
-  stopProgress()
-  fakeProgress = 4
+  stopProgress(id)
+
+  const state = {
+    progress: 4,
+    timer: null,
+  }
 
   // Progreso simulado para mantener feedback visual mientras WebCrypto termina.
-  fakeTimer = setInterval(() => {
-    fakeProgress = Math.min(fakeProgress + Math.random() * 7 + 1, 90)
-    self.postMessage({ id, type: 'progress', progress: Math.round(fakeProgress) })
+  state.timer = setInterval(() => {
+    state.progress = Math.min(state.progress + Math.random() * 7 + 1, 90)
+    self.postMessage({ id, type: 'progress', progress: Math.round(state.progress) })
   }, 120)
+
+  progressByTaskId.set(id, state)
 }
 
-function stopProgress() {
-  if (fakeTimer) {
-    clearInterval(fakeTimer)
-    fakeTimer = null
+function stopProgress(id) {
+  const state = progressByTaskId.get(id)
+  if (!state) {
+    return
   }
+
+  if (state.timer) {
+    clearInterval(state.timer)
+  }
+
+  progressByTaskId.delete(id)
 }
 
 function serializeError(error) {
@@ -42,18 +53,44 @@ self.onmessage = async (event) => {
 
     if (operation === 'encrypt') {
       result = await encryptFile(payload.fileBuffer, payload.password, payload.algorithm)
+    } else if (operation === 'pack') {
+      result = await packFiles(payload.files)
     } else if (operation === 'decrypt') {
-      result = await decryptFile(payload.encryptedBuffer, payload.password, payload.algorithm)
+      const plainBuffer = await decryptFile(
+        payload.encryptedBuffer,
+        payload.password,
+        payload.algorithm,
+      )
+
+      let unpackedFiles = []
+      if (payload.includeZipMetadata && isZipBuffer(plainBuffer)) {
+        unpackedFiles = await unpackZip(plainBuffer, { metadataOnly: true })
+      }
+
+      result = {
+        plainBuffer,
+        unpackedFiles,
+      }
     } else {
       throw new Error(`Unknown operation: ${operation}`)
     }
 
-    stopProgress()
+    stopProgress(id)
     self.postMessage({ id, type: 'progress', progress: 100 })
-    // Enviamos el resultado como transferable para evitar copias en memoria.
-    self.postMessage({ id, type: 'result', result }, [result])
+
+    const transferables = []
+    if (result instanceof ArrayBuffer) {
+      transferables.push(result)
+    }
+
+    if (result?.plainBuffer instanceof ArrayBuffer) {
+      transferables.push(result.plainBuffer)
+    }
+
+    // Enviamos resultados como transferable para evitar copias en memoria.
+    self.postMessage({ id, type: 'result', result }, transferables)
   } catch (error) {
-    stopProgress()
+    stopProgress(id)
     self.postMessage({ id, type: 'error', error: serializeError(error) })
   }
 }

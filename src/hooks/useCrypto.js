@@ -13,6 +13,81 @@ import {
 import { decryptRequestSchema, encryptRequestSchema } from '../utils/validationSchemas'
 
 const WORKER_THRESHOLD_BYTES = 10 * 1024 * 1024
+// Estado compartido a nivel modulo: evita crear un worker por cada ActionCard.
+const sharedWorkerState = {
+  worker: null,
+  consumers: 0,
+  pendingTasks: new Map(),
+  messageId: 0,
+}
+
+function mapWorkerError(workerError) {
+  const mapped = new Error(workerError?.message || 'Worker crypto error')
+  mapped.name = workerError?.name || 'Error'
+  return mapped
+}
+
+function ensureSharedWorker() {
+  if (typeof Worker === 'undefined') {
+    return null
+  }
+
+  if (sharedWorkerState.worker) {
+    return sharedWorkerState.worker
+  }
+
+  const worker = new Worker(new URL('../workers/cryptoWorker.js', import.meta.url), {
+    type: 'module',
+  })
+
+  // Router central de respuestas del worker para todas las tareas pendientes.
+  worker.onmessage = (event) => {
+    const { id, type, progress: nextProgress, result, error: workerError } = event.data
+    const task = sharedWorkerState.pendingTasks.get(id)
+
+    if (!task) {
+      return
+    }
+
+    if (type === 'progress') {
+      task.onProgress?.(nextProgress)
+      return
+    }
+
+    if (type === 'result') {
+      sharedWorkerState.pendingTasks.delete(id)
+      task.resolve(result)
+      return
+    }
+
+    if (type === 'error') {
+      sharedWorkerState.pendingTasks.delete(id)
+      task.reject(mapWorkerError(workerError))
+    }
+  }
+
+  worker.onerror = (event) => {
+    const mapped = new Error(event?.message || 'Worker failed')
+    sharedWorkerState.pendingTasks.forEach(({ reject }) => reject(mapped))
+    sharedWorkerState.pendingTasks.clear()
+  }
+
+  sharedWorkerState.worker = worker
+  return worker
+}
+
+function releaseSharedWorker() {
+  // Libera el worker solo cuando no quedan hooks activos usando este modulo.
+  sharedWorkerState.consumers = Math.max(0, sharedWorkerState.consumers - 1)
+  if (sharedWorkerState.consumers > 0 || !sharedWorkerState.worker) {
+    return
+  }
+
+  sharedWorkerState.pendingTasks.forEach(({ reject }) => reject(new Error('Worker terminated')))
+  sharedWorkerState.pendingTasks.clear()
+  sharedWorkerState.worker.terminate()
+  sharedWorkerState.worker = null
+}
 
 function toKnownError(error) {
   if (error instanceof WrongPasswordError || error instanceof CorruptFileError) {
@@ -58,53 +133,20 @@ export function useCrypto() {
   const [status, setStatus] = useState('idle')
   const [progress, setProgress] = useState(0)
   const [error, setError] = useState(null)
-  const workerRef = useRef(null)
-  const pendingRef = useRef(new Map())
-  const messageIdRef = useRef(0)
+  const mountedRef = useRef(true)
 
   useEffect(() => {
-    if (typeof Worker === 'undefined') {
-      return () => {}
-    }
-
-    const worker = new Worker(new URL('../workers/cryptoWorker.js', import.meta.url), {
-      type: 'module',
-    })
-    workerRef.current = worker
-    const pendingTasks = pendingRef.current
-
-    worker.onmessage = (event) => {
-      const { id, type, progress: nextProgress, result, error: workerError } = event.data
-      const resolver = pendingTasks.get(id)
-
-      if (!resolver) {
-        return
-      }
-
-      if (type === 'progress') {
-        setProgress(nextProgress)
-        return
-      }
-
-      if (type === 'result') {
-        pendingTasks.delete(id)
-        resolver.resolve(result)
-        return
-      }
-
-      if (type === 'error') {
-        pendingTasks.delete(id)
-        const mapped = new Error(workerError?.message || 'Worker crypto error')
-        mapped.name = workerError?.name || 'Error'
-        resolver.reject(mapped)
-      }
+    mountedRef.current = true
+    if (typeof Worker !== 'undefined') {
+      sharedWorkerState.consumers += 1
+      ensureSharedWorker()
     }
 
     return () => {
-      pendingTasks.forEach(({ reject }) => reject(new Error('Worker terminated')))
-      pendingTasks.clear()
-      worker.terminate()
-      workerRef.current = null
+      mountedRef.current = false
+      if (typeof Worker !== 'undefined') {
+        releaseSharedWorker()
+      }
     }
   }, [])
 
@@ -114,15 +156,28 @@ export function useCrypto() {
     setError(null)
   }, [])
 
-  const runWorkerTask = useCallback((operation, payload) => {
-    if (!workerRef.current) {
+  const setProgressIfMounted = useCallback((nextProgress) => {
+    if (mountedRef.current) {
+      setProgress(nextProgress)
+    }
+  }, [])
+
+  const runWorkerTask = useCallback((operation, payload, options = {}) => {
+    const worker = ensureSharedWorker()
+    if (!worker) {
       return Promise.reject(new Error('Worker unavailable'))
     }
 
-    const id = ++messageIdRef.current
+    const id = ++sharedWorkerState.messageId
+    const onProgress = options.onProgress
 
     return new Promise((resolve, reject) => {
-      pendingRef.current.set(id, { resolve, reject })
+      // Cada tarea conserva su resolver/reject para desacoplar multiples llamadas concurrentes.
+      sharedWorkerState.pendingTasks.set(id, {
+        resolve,
+        reject,
+        onProgress,
+      })
 
       // Transferimos ownership de buffers grandes para evitar copias costosas.
       const transferables = []
@@ -134,7 +189,7 @@ export function useCrypto() {
         transferables.push(payload.encryptedBuffer)
       }
 
-      workerRef.current.postMessage({ id, operation, payload }, transferables)
+      worker.postMessage({ id, operation, payload }, transferables)
     })
   }, [])
 
@@ -163,9 +218,19 @@ export function useCrypto() {
         let originalName
 
         // Si hay multiples archivos se empaquetan antes de cifrar.
+        const canUseWorker = typeof Worker !== 'undefined'
+
         if (safeFiles.length > 1) {
           setProgress(10)
-          rawBuffer = await packFiles(safeFiles)
+          rawBuffer = canUseWorker
+            ? await runWorkerTask(
+                'pack',
+                { files: safeFiles },
+                {
+                  onProgress: setProgressIfMounted,
+                },
+              )
+            : await packFiles(safeFiles)
           originalName = `vault-bundle-${Date.now()}.zip`
           setProgress(28)
         } else {
@@ -174,13 +239,19 @@ export function useCrypto() {
           setProgress(20)
         }
 
-        const useWorker = rawBuffer.byteLength > WORKER_THRESHOLD_BYTES && workerRef.current
+        const useWorker = canUseWorker && rawBuffer.byteLength > WORKER_THRESHOLD_BYTES
         const encryptedBuffer = useWorker
-          ? await runWorkerTask('encrypt', {
-              fileBuffer: rawBuffer,
-              password: safePassword,
-              algorithm: safeAlgorithm,
-            })
+          ? await runWorkerTask(
+              'encrypt',
+              {
+                fileBuffer: rawBuffer,
+                password: safePassword,
+                algorithm: safeAlgorithm,
+              },
+              {
+                onProgress: setProgressIfMounted,
+              },
+            )
           : await encryptFile(rawBuffer, safePassword, safeAlgorithm)
 
         setProgress(100)
@@ -203,7 +274,7 @@ export function useCrypto() {
         throw mapped
       }
     },
-    [runWorkerTask],
+    [runWorkerTask, setProgressIfMounted],
   )
 
   const decrypt = useCallback(
@@ -231,18 +302,42 @@ export function useCrypto() {
         const detectedAlgorithm = detectAlgorithmFromEncryptedBuffer(encryptedBuffer)
         setProgress(18)
 
-        const useWorker = encryptedBuffer.byteLength > WORKER_THRESHOLD_BYTES && workerRef.current
-        const plainBuffer = useWorker
-          ? await runWorkerTask('decrypt', {
+        const canUseWorker = typeof Worker !== 'undefined'
+        const useWorker = canUseWorker && encryptedBuffer.byteLength > WORKER_THRESHOLD_BYTES
+
+        let plainBuffer
+        let unpackedFiles = []
+
+        if (useWorker) {
+          // El worker descifra y extrae solo metadata ZIP para no duplicar buffers en memoria.
+          const workerResult = await runWorkerTask(
+            'decrypt',
+            {
               encryptedBuffer,
               password: safePassword,
               algorithm: preferredAlgorithm || detectedAlgorithm,
-            })
-          : await decryptFile(
-              encryptedBuffer,
-              safePassword,
-              preferredAlgorithm || detectedAlgorithm,
-            )
+              includeZipMetadata: true,
+            },
+            {
+              onProgress: setProgressIfMounted,
+            },
+          )
+
+          plainBuffer = workerResult.plainBuffer
+          unpackedFiles = workerResult.unpackedFiles || []
+        } else {
+          plainBuffer = await decryptFile(
+            encryptedBuffer,
+            safePassword,
+            preferredAlgorithm || detectedAlgorithm,
+          )
+        }
+
+        if (!useWorker && isZipBuffer(plainBuffer)) {
+          unpackedFiles = await unpackZip(plainBuffer, { metadataOnly: true })
+        }
+
+        const isZipPayload = isZipBuffer(plainBuffer)
 
         setProgress(92)
 
@@ -258,17 +353,16 @@ export function useCrypto() {
           },
         }
 
-        // Si el payload descifrado es ZIP, lo dejamos listo para descarga directa.
-        if (isZipBuffer(plainBuffer)) {
-          const unpacked = await unpackZip(plainBuffer)
+        // Si el payload descifrado es ZIP, se muestra metadata sin cargar binarios a memoria.
+        if (isZipPayload) {
           output = {
             blob: new Blob([plainBuffer], { type: 'application/zip' }),
             fileName: getDecryptedDownloadName(baseName, true),
             metadata: {
               algorithm: detectedAlgorithm,
-              fileCount: unpacked.length,
+              fileCount: unpackedFiles.length,
               decryptedSize: plainBuffer.byteLength,
-              unpackedFiles: unpacked,
+              unpackedFiles,
             },
           }
         }
@@ -284,7 +378,7 @@ export function useCrypto() {
         throw mapped
       }
     },
-    [runWorkerTask],
+    [runWorkerTask, setProgressIfMounted],
   )
 
   return {

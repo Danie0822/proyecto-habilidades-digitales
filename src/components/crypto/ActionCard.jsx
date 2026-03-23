@@ -48,15 +48,19 @@ export function ActionCard({ mode = 'encrypt', onActive }) {
     onActive(mode)
     setResult(null)
 
-    if (isEncrypt) {
-      const output = await encrypt({ files, password, algorithm })
-      setResult(output)
-      return
-    }
+    try {
+      if (isEncrypt) {
+        const output = await encrypt({ files, password, algorithm })
+        setResult(output)
+        return
+      }
 
-    const target = files[0]
-    const output = await decrypt({ file: target, password, algorithm: undefined })
-    setResult(output)
+      const target = files[0]
+      const output = await decrypt({ file: target, password, algorithm })
+      setResult(output)
+    } catch {
+      // El error ya se publica desde useCrypto para mostrar feedback en UI.
+    }
   }
 
   return (
