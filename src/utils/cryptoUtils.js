@@ -25,6 +25,8 @@ const textEncoder = new TextEncoder()
 const MAGIC = textEncoder.encode('CVLT')
 // Este marcador permite detectar contrasena incorrecta tras descifrar.
 const PLAIN_MARKER = textEncoder.encode('CV01')
+const HEADER_VERSION_V2 = 127
+const SALT_LENGTH_BYTES = 16
 
 // Config de algoritmos soportados + metadatos para serializacion en header.
 const ALGORITHMS = {
@@ -121,7 +123,7 @@ function hasMagicHeader(bytes) {
   )
 }
 
-async function deriveKey(password, algorithmName) {
+async function deriveKey(password, algorithmName, saltBuffer) {
   if (!password || typeof password !== 'string') {
     throw new WrongPasswordError('A password is required')
   }
@@ -135,8 +137,7 @@ async function deriveKey(password, algorithmName) {
     ['deriveBits'],
   )
 
-  // El salt se separa por algoritmo para evitar reutilizacion de claves entre modos.
-  const salt = textEncoder.encode(`CryptoVault::${config.name}`)
+  const salt = new Uint8Array(ensureArrayBuffer(saltBuffer))
   const keyMaterial = await crypto.subtle.deriveBits(
     {
       name: 'PBKDF2',
@@ -195,7 +196,7 @@ function unwrapPlaintext(decryptedBuffer) {
 function parseHeader(encryptedBuffer) {
   const view = new Uint8Array(encryptedBuffer)
 
-  if (view.byteLength < 4 + 1 + 8) {
+  if (view.byteLength < 7) {
     throw new CorruptFileError('Encrypted file is too small')
   }
 
@@ -203,28 +204,36 @@ function parseHeader(encryptedBuffer) {
     throw new CorruptFileError('Missing CryptoVault magic header')
   }
 
-  // Layout binario fijo: [MAGIC(4)][ALGO(1)][IV][CIPHERTEXT]
-  const algorithmId = view[4]
+  if (view[4] !== HEADER_VERSION_V2) {
+    throw new CorruptFileError('Unsupported CryptoVault format version')
+  }
+
+  // Layout v2: [MAGIC(4)][VERSION(1)][ALGO(1)][SALT_LEN(1)][SALT][IV][CIPHERTEXT]
+  const algorithmId = view[5]
   const config = resolveAlgorithm(algorithmId)
-  const ivStart = 5
+  const saltLength = view[6]
+  const saltStart = 7
+  const saltEnd = saltStart + saltLength
+  const ivStart = saltEnd
   const ivEnd = ivStart + config.ivLength
 
-  if (view.byteLength <= ivEnd) {
+  if (saltLength !== SALT_LENGTH_BYTES || view.byteLength <= ivEnd) {
     throw new CorruptFileError('Encrypted payload is truncated')
   }
 
-  // subarray evita copias grandes; WebCrypto acepta TypedArray como BufferSource.
+  const salt = view.subarray(saltStart, saltEnd)
   const iv = view.subarray(ivStart, ivEnd)
   const ciphertext = view.subarray(ivEnd)
 
-  return { config, iv, ciphertext }
+  return { config, iv, ciphertext, salt }
 }
 
 export async function encryptFile(fileBuffer, password, algorithm) {
   const normalizedBuffer = ensureArrayBuffer(fileBuffer)
   const config = resolveAlgorithm(algorithm)
+  const salt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH_BYTES))
   const iv = crypto.getRandomValues(new Uint8Array(config.ivLength))
-  const key = await deriveKey(password, config.name)
+  const key = await deriveKey(password, config.name, salt)
   const payload = wrapPlaintext(normalizedBuffer)
 
   let encrypted
@@ -244,25 +253,27 @@ export async function encryptFile(fileBuffer, password, algorithm) {
     throw new CorruptFileError('Encryption failed')
   }
 
-  const header = new Uint8Array(5)
-  // Se antepone el header para poder autodetectar formato y algoritmo.
+  const header = new Uint8Array(7)
+  // Header versionado para soportar evolucion del formato de cifrado.
   header.set(MAGIC, 0)
-  header[4] = config.id
+  header[4] = HEADER_VERSION_V2
+  header[5] = config.id
+  header[6] = salt.byteLength
 
-  // Formato final: [CVLT][ALG_ID][IV][CIPHERTEXT]
-  return concatArrayBuffers(header.buffer, iv.buffer, encrypted)
+  // Formato final v2: [CVLT][VER][ALG_ID][SALT_LEN][SALT][IV][CIPHERTEXT]
+  return concatArrayBuffers(header.buffer, salt.buffer, iv.buffer, encrypted)
 }
 
 export async function decryptFile(encryptedBuffer, password, algorithm) {
   const normalized = ensureArrayBuffer(encryptedBuffer)
-  const { config, iv, ciphertext } = parseHeader(normalized)
+  const { config, iv, ciphertext, salt } = parseHeader(normalized)
 
   if (algorithm && algorithm !== config.name) {
     // No filtramos detalles del algoritmo real para evitar pistas al usuario.
     throw new WrongPasswordError()
   }
 
-  const key = await deriveKey(password, config.name)
+  const key = await deriveKey(password, config.name, salt)
 
   let decrypted
   try {
@@ -293,14 +304,12 @@ export async function packFiles(fileList) {
 
   const zip = new JSZip()
 
-  // Conserva rutas relativas de carpetas cuando el navegador las provee.
-  await Promise.all(
-    fileList.map(async (file) => {
-      const path = file.webkitRelativePath || file.name
-      const buffer = await file.arrayBuffer()
-      zip.file(path, buffer)
-    }),
-  )
+  // Conserva rutas relativas y limita memoria procesando secuencialmente.
+  for (const file of fileList) {
+    const path = file.webkitRelativePath || file.name
+    const buffer = await file.arrayBuffer()
+    zip.file(path, buffer)
+  }
 
   return zip.generateAsync({
     type: 'arraybuffer',
@@ -375,7 +384,15 @@ export function detectAlgorithmFromEncryptedBuffer(encryptedBuffer) {
     throw new CorruptFileError('Not a CryptoVault encrypted file')
   }
 
-  return resolveAlgorithm(bytes[4]).name
+  if (bytes[4] !== HEADER_VERSION_V2) {
+    throw new CorruptFileError('Unsupported CryptoVault format version')
+  }
+
+  if (bytes.length < 6) {
+    throw new CorruptFileError('Encrypted payload is truncated')
+  }
+
+  return resolveAlgorithm(bytes[5]).name
 }
 
 export function isZipBuffer(buffer) {

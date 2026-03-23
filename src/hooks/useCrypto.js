@@ -70,6 +70,12 @@ function ensureSharedWorker() {
     const mapped = new Error(event?.message || 'Worker failed')
     sharedWorkerState.pendingTasks.forEach(({ reject }) => reject(mapped))
     sharedWorkerState.pendingTasks.clear()
+
+    // Si falla la instancia actual, se descarta para forzar recreacion limpia.
+    worker.terminate()
+    if (sharedWorkerState.worker === worker) {
+      sharedWorkerState.worker = null
+    }
   }
 
   sharedWorkerState.worker = worker
@@ -315,7 +321,7 @@ export function useCrypto() {
             {
               encryptedBuffer,
               password: safePassword,
-              algorithm: preferredAlgorithm || detectedAlgorithm,
+              algorithm: preferredAlgorithm,
               includeZipMetadata: true,
             },
             {
@@ -329,7 +335,7 @@ export function useCrypto() {
           plainBuffer = await decryptFile(
             encryptedBuffer,
             safePassword,
-            preferredAlgorithm || detectedAlgorithm,
+            preferredAlgorithm,
           )
         }
 

@@ -14,13 +14,14 @@ function downloadBlob(blob, fileName) {
   anchor.href = url
   anchor.download = fileName
   anchor.click()
-  URL.revokeObjectURL(url)
-} 
+  // Se difiere la revocacion para evitar cortes intermitentes en algunos browsers.
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+}
 
 export function ActionCard({ mode = 'encrypt', onActive }) {
   const [files, setFiles] = useState([])
   const [password, setPassword] = useState('')
-  const [algorithm, setAlgorithm] = useState('AES-GCM')
+  const [algorithm, setAlgorithm] = useState(mode === 'encrypt' ? 'AES-GCM' : '')
   const [result, setResult] = useState(null)
 
   const { encrypt, decrypt, status, progress, error, reset } = useCrypto()
@@ -56,7 +57,7 @@ export function ActionCard({ mode = 'encrypt', onActive }) {
       }
 
       const target = files[0]
-      const output = await decrypt({ file: target, password, algorithm })
+      const output = await decrypt({ file: target, password, algorithm: algorithm || undefined })
       setResult(output)
     } catch {
       // El error ya se publica desde useCrypto para mostrar feedback en UI.
