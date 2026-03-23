@@ -4,6 +4,8 @@ import { ActionCard } from '../components/crypto/ActionCard'
 
 export function VaultPage() {
   const [activeOperation, setActiveOperation] = useState('encrypt')
+  const origin = typeof window !== 'undefined' ? window.location.origin : ''
+  const canonicalUrl = `${origin}/`
 
   const pageTitle = useMemo(() => {
     if (activeOperation === 'decrypt') {
@@ -17,14 +19,25 @@ export function VaultPage() {
     <>
       <Helmet>
         <title>{pageTitle}</title>
+        <link rel="canonical" href={canonicalUrl} />
         <meta
           name="description"
           content="CryptoVault cifra y descifra archivos localmente en tu navegador usando WebCrypto API y sin backend."
         />
+        <meta name="robots" content="index,follow" />
         <meta property="og:title" content={pageTitle} />
         <meta
           property="og:description"
           content="Boveda criptografica local con AES-256-GCM y modo 3DES legacy para compatibilidad."
+        />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content={canonicalUrl} />
+        <meta property="og:image" content={`${origin}/favicon.svg`} />
+        <meta name="twitter:card" content="summary" />
+        <meta name="twitter:title" content={pageTitle} />
+        <meta
+          name="twitter:description"
+          content="Cifrado y descifrado local de archivos con WebCrypto API en tu navegador."
         />
       </Helmet>
 

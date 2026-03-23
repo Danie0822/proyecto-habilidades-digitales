@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://cryptovault.danielmorales.tech/sitemap.xml

@@ -8,14 +8,28 @@ const members = [
 ]
 
 export function TeamPage() {
+  const origin = typeof window !== 'undefined' ? window.location.origin : ''
+  const canonicalUrl = `${origin}/equipo`
+
   return (
     <>
       <Helmet>
         <title>CryptoVault | Equipo 3</title>
+        <link rel="canonical" href={canonicalUrl} />
         <meta
           name="description"
           content="Integrantes del Equipo 3 y resumen de algoritmos de cifrado de CryptoVault."
         />
+        <meta name="robots" content="index,follow" />
+        <meta property="og:title" content="CryptoVault | Equipo 3" />
+        <meta
+          property="og:description"
+          content="Conoce al Equipo 3 y el resumen tecnico de los algoritmos usados en CryptoVault."
+        />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content={canonicalUrl} />
+        <meta property="og:image" content={`${origin}/favicon.svg`} />
+        <meta name="twitter:card" content="summary" />
       </Helmet>
 
       <section className="grid gap-4 lg:grid-cols-2">
