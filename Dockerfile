@@ -12,15 +12,14 @@ RUN --mount=type=secret,id=vite_env,required=false \
     npm run build && \
     rm -f .env
 
-FROM nginx:1.27-alpine AS production
+FROM node:20-alpine AS production
+WORKDIR /app
 
-COPY nginx.conf /etc/nginx/nginx.conf
-COPY --from=builder /app/dist /usr/share/nginx/html
+RUN addgroup -S app && adduser -S app -G app && npm install -g serve
 
-RUN mkdir -p /tmp/client_temp /tmp/proxy_temp /tmp/fastcgi_temp /tmp/uwsgi_temp /tmp/scgi_temp && \
-    chown -R nginx:nginx /usr/share/nginx/html /var/cache/nginx /var/log/nginx /etc/nginx /tmp
+COPY --from=builder /app/dist ./dist
 
-USER nginx
+USER app
 EXPOSE 8080
 
-CMD ["nginx", "-g", "daemon off;"]
+CMD ["serve", "-s", "dist", "-l", "8080"]
