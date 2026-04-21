@@ -15,11 +15,11 @@ RUN --mount=type=secret,id=vite_env,required=false \
 FROM node:20-alpine AS production
 WORKDIR /app
 
-RUN addgroup -S app && adduser -S app -G app && npm install -g serve
+RUN addgroup -S app && adduser -S app -G app && npm install -g serve@14.2.6
 
 COPY --from=builder /app/dist ./dist
 
 USER app
 EXPOSE 8080
 
-CMD ["serve", "-s", "dist", "-l", "8080"]
+CMD ["serve", "-s", "dist", "-l", "8080", "--no-port-switching"]
