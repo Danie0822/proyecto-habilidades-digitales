@@ -3,11 +3,5 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      secrets:
-        - vite_env
     ports:
       - "8080:8080"
-
-secrets:
-  vite_env:
-    file: .env
