@@ -138,7 +138,6 @@ async function deriveKey(password, algorithmName, saltBuffer) {
     ['deriveBits'],
   )
 
-  
   const salt = new Uint8Array(ensureArrayBuffer(saltBuffer))
   const keyMaterial = await crypto.subtle.deriveBits(
     {
