@@ -1,4 +1,5 @@
 import JSZip from 'jszip'
+import CryptoJS from 'crypto-js'
 
 export class WrongPasswordError extends Error {
   constructor(message = 'Hubo un error al descifrar el archivo. verifica los datos. ') {
@@ -149,30 +150,20 @@ async function deriveKey(password, algorithmName, saltBuffer) {
     config.deriveLengthBits,
   )
 
-  try {
-    // ImportKey cambia segun algoritmo para mantener compatibilidad WebCrypto.
-    if (config.name === 'AES-GCM') {
-      return await crypto.subtle.importKey(
-        'raw',
-        keyMaterial,
-        { name: 'AES-GCM', length: config.keyLengthBits },
-        false,
-        ['encrypt', 'decrypt'],
-      )
-    }
-
-    return await crypto.subtle.importKey(
+  // AES-GCM: usa WebCrypto nativo (soportado en todos los navegadores modernos).
+  if (config.name === 'AES-GCM') {
+    return crypto.subtle.importKey(
       'raw',
       keyMaterial,
-      { name: config.webcryptoName },
+      { name: 'AES-GCM', length: config.keyLengthBits },
       false,
       ['encrypt', 'decrypt'],
     )
-  } catch {
-    throw new UnsupportedAlgorithmError(
-      `${config.name} is unavailable in this browser WebCrypto implementation`,
-    )
   }
+
+  // 3DES-CBC: WebCrypto elimino DES-EDE3-CBC en navegadores modernos.
+  // Se devuelven los bytes raw para usarlos con crypto-js en software puro.
+  return new Uint8Array(keyMaterial)
 }
 
 function wrapPlaintext(fileBuffer) {
@@ -228,6 +219,17 @@ function parseHeader(encryptedBuffer) {
   return { config, iv, ciphertext, salt }
 }
 
+// Convierte un WordArray de crypto-js a ArrayBuffer estandar.
+function wordArrayToArrayBuffer(wordArray) {
+  const words = wordArray.words
+  const sigBytes = wordArray.sigBytes
+  const u8 = new Uint8Array(sigBytes)
+  for (let i = 0; i < sigBytes; i++) {
+    u8[i] = (words[i >>> 2] >>> (24 - (i % 4) * 8)) & 0xff
+  }
+  return u8.buffer
+}
+
 export async function encryptFile(fileBuffer, password, algorithm) {
   const normalizedBuffer = ensureArrayBuffer(fileBuffer)
   const config = resolveAlgorithm(algorithm)
@@ -239,9 +241,21 @@ export async function encryptFile(fileBuffer, password, algorithm) {
   let encrypted
   try {
     if (config.name === 'AES-GCM') {
+      // AES-GCM soportado nativamente en WebCrypto en todos los navegadores modernos.
       encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, payload)
     } else if (config.name === '3DES-CBC') {
-      encrypted = await crypto.subtle.encrypt({ name: config.webcryptoName, iv }, key, payload)
+      // 3DES eliminado de WebCrypto: se usa implementacion software crypto-js.
+      const keyWords = CryptoJS.lib.WordArray.create(key)
+      const ivWords = CryptoJS.lib.WordArray.create(iv)
+      const payloadBytes = new Uint8Array(ensureArrayBuffer(payload))
+      const payloadWords = CryptoJS.lib.WordArray.create(payloadBytes)
+      const result = CryptoJS.TripleDES.encrypt(payloadWords, keyWords, {
+        iv: ivWords,
+        mode: CryptoJS.mode.CBC,
+        padding: CryptoJS.pad.Pkcs7,
+      })
+      // Extraer bytes del ciphertext de la estructura WordArray de crypto-js.
+      encrypted = wordArrayToArrayBuffer(result.ciphertext)
     } else {
       throw new UnsupportedAlgorithmError(`Unsupported algorithm: ${algorithm}`)
     }
@@ -278,9 +292,23 @@ export async function decryptFile(encryptedBuffer, password, algorithm) {
   let decrypted
   try {
     if (config.name === 'AES-GCM') {
+      // AES-GCM soportado nativamente en WebCrypto en todos los navegadores modernos.
       decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext)
+    } else if (config.name === '3DES-CBC') {
+      // 3DES eliminado de WebCrypto: se usa implementacion software crypto-js.
+      const keyWords = CryptoJS.lib.WordArray.create(key)
+      const ivWords = CryptoJS.lib.WordArray.create(iv)
+      const ciphertextBytes = new Uint8Array(ensureArrayBuffer(ciphertext))
+      const ciphertextWords = CryptoJS.lib.WordArray.create(ciphertextBytes)
+      const cipherParams = CryptoJS.lib.CipherParams.create({ ciphertext: ciphertextWords })
+      const result = CryptoJS.TripleDES.decrypt(cipherParams, keyWords, {
+        iv: ivWords,
+        mode: CryptoJS.mode.CBC,
+        padding: CryptoJS.pad.Pkcs7,
+      })
+      decrypted = wordArrayToArrayBuffer(result)
     } else {
-      decrypted = await crypto.subtle.decrypt({ name: config.webcryptoName, iv }, key, ciphertext)
+      throw new UnsupportedAlgorithmError(`Unsupported algorithm: ${config.name}`)
     }
   } catch (error) {
     if (error instanceof UnsupportedAlgorithmError) {
@@ -291,6 +319,7 @@ export async function decryptFile(encryptedBuffer, password, algorithm) {
       throw new WrongPasswordError()
     }
 
+    // Error de padding de 3DES con clave incorrecta se detecta en unwrapPlaintext.
     throw new CorruptFileError('Unable to decrypt payload')
   }
 
